@@ -1,11 +1,13 @@
 # Copyright (C) Juewuy
 
 require 'digest'
+require 'etc'
 require 'fileutils'
 require 'ipaddr'
 require 'json'
 require 'open3'
 require 'optparse'
+require 'shellwords'
 require 'socket'
 require 'tmpdir'
 require 'yaml'
@@ -20,30 +22,42 @@ class DarwinShellCrash
   PF_MODES = %w[redir mix tproxy].freeze
   TUN_MODES = %w[tun mix].freeze
   FOREGROUND_MODES = (PF_MODES + ['bypass']).freeze
+  SYSTEM_HOME = '/Library/Application Support/ShellCrash'.freeze
+  SYSTEM_COMMAND = '/usr/local/bin/crash'.freeze
 
   def initialize
-    home = ENV['SHELLCRASH_HOME'] || ENV['CRASHDIR'] || '~/Library/Application Support/ShellCrash'
+    @explicit_home = ENV['SHELLCRASH_HOME'] || ENV['CRASHDIR']
+    @explicit_home ||= __dir__ if File.executable?(File.join(__dir__, 'bin', 'mihomo'))
+    home = @explicit_home || (Process.euid.zero? ? SYSTEM_HOME : '~/Library/Application Support/ShellCrash')
     @home = File.expand_path(home)
     @bin = File.join(@home, 'bin', 'mihomo')
     @yamls = File.join(@home, 'yamls')
     @runtime = File.join(@home, 'runtime')
     @session_file = File.join(@runtime, 'session.json')
     @log = File.join(@home, 'logs', 'mihomo.log')
+    @instance_file = File.join(@home, 'installation.json')
   end
 
   def call(args)
+    args = ['menu'] if args.empty? && instance
+    args.shift if args.first == '-s'
     command = args.shift || 'help'
+    if system_reader? && (!%w[help --help -h menu status mode].include?(command) || (command == 'mode' && !args.empty?))
+      raise "Run this operation with sudo #{Shellwords.escape(instance.fetch('command'))}"
+    end
     case command
     when 'help', '--help', '-h' then help
     when 'menu' then menu
-    when 'install' then locked { install(args) }
+    when 'install' then install(args)
     when 'core' then locked { install_core(args) }
     when 'config' then locked { config(args) }
     when 'pf-rules' then preview_pf(args.shift)
+    when 'mode'
+      args.empty? ? select_mode(args) : locked { select_mode(args) }
     when 'check' then locked { check_mode(mode(args), args.shift) }
     when 'start', 'run' then launch(mode(args), args.shift, command == 'run')
     when 'stop' then locked { stop }
-    when 'status' then locked { status }
+    when 'status' then system_reader? ? status : locked { status }
     when 'restart' then locked { restart(args) }
     else raise ArgumentError, "Unknown Darwin command #{command}. See help."
     end
@@ -55,15 +69,20 @@ class DarwinShellCrash
   def help
     puts <<~HELP
       ShellCrash for macOS
-      install [mihomo.gz [--sha256 SHA]]  Install in the user's ShellCrash directory
+      install [mihomo.gz] [--sha256 SHA]  Install for the current user, or system-wide with sudo
+        --scope user|system             Enable a managed installation at an explicit SHELLCRASH_HOME
+        --command-dir DIR               Choose where to install the crash command
+        --local-uid UID                 Choose the non-root user for local transparent proxying
       core [mihomo.gz [--sha256 SHA]]     Install the verified official release or local build
       config import FILE | fetch URL    Validate and save a complete Mihomo YAML
       check [pure|redir|tun|mix|bypass|tproxy] [FILE]
       pf-rules [redir|bypass]            Preview the configured PF rules
       run [pure|redir|tun|mix|bypass|tproxy] [FILE]
-      start [pure|tun] [FILE]            Start a managed process
+      mode [pure|redir|tun|mix|bypass|tproxy]
+      start [pure|tun] [FILE]            Start the selected mode
       status | stop | restart [pure|tun] [FILE]
-      SHELLCRASH_HOME sets the configuration and data directory.
+      crash --user / crash --system selects the installed instance.
+      SHELLCRASH_HOME sets the configuration and data directory for direct scripts.
       Tun requires root and uses Mihomo's system routing.
       PF Redir requires root and uses configs/darwin-pf.yaml.
       Mix uses the same PF settings for TCP and UDP.
@@ -74,6 +93,7 @@ class DarwinShellCrash
 
   def menu
     return help unless $stdin.tty?
+    return managed_menu if instance
 
     loop do
       puts "1. Status\n2. Start explicit proxy\n3. Stop\n4. Import Mihomo YAML"
@@ -100,6 +120,32 @@ class DarwinShellCrash
     end
   end
 
+  def managed_menu
+    loop do
+      puts "ShellCrash (#{instance.fetch('scope')}): #{@home}"
+      status if system_reader?
+      puts "1. Start/restart\n2. Select connection mode (#{instance.fetch('mode')})\n3. Stop\n6. Import configuration\n8. Status\n0. Exit"
+      print '> '
+      case $stdin.gets&.strip
+      when '1' then call(['restart'])
+      when '2'
+        choices = instance['scope'] == 'user' ? ['pure'] : MODES
+        print "Mode (#{choices.join(', ')}): "
+        value = $stdin.gets&.strip
+        call(['mode', value]) if value && !value.empty?
+      when '3' then call(['stop'])
+      when '6'
+        print 'YAML file: '
+        source = $stdin.gets&.strip
+        call(['config', 'import', source]) if source && !source.empty?
+      when '8' then call(['status'])
+      when nil, '0' then break
+      end
+    rescue ArgumentError, RuntimeError, SystemCallError, Psych::Exception => error
+      warn error.message
+    end
+  end
+
   def locked
     FileUtils.mkdir_p(@runtime, mode: 0o700)
     File.open(File.join(@runtime, 'lock'), File::RDWR | File::CREAT, 0o600) do |lock|
@@ -109,24 +155,183 @@ class DarwinShellCrash
   end
 
   def mode(args)
-    value = (args.shift || 'pure').downcase
+    value = (args.shift || instance&.fetch('mode') || 'pure').downcase
     raise ArgumentError, "Darwin mode #{value} is not enabled; available: #{MODES.join(', ')}" unless MODES.include?(value)
 
     value
   end
 
   def install(args)
-    install_core(args)
-    FileUtils.mkdir_p(@yamls, mode: 0o700)
-    %w[darwin.rb darwin_pf.py darwin_udp.py darwin_tcp.py darwin_tproxy.py menu.sh start.sh].each do |file|
-      source = File.join(__dir__, file)
-      destination = File.join(@home, file)
-      FileUtils.install(source, destination, mode: 0o755) unless File.identical?(source, destination)
+    scope = command_dir = local_uid = nil
+    archive_options = []
+    OptionParser.new do |parser|
+      parser.on('--scope SCOPE', %w[user system]) { |value| scope = value }
+      parser.on('--command-dir DIR') { |value| command_dir = File.expand_path(value) }
+      parser.on('--local-uid UID', Integer) { |value| local_uid = value }
+      parser.on('--sha256 SHA') { |value| archive_options.concat(['--sha256', value]) }
+    end.parse!(args)
+    next_scope = Process.euid.zero? ? 'system' : 'user'
+    raise ArgumentError, "This installer is running with #{next_scope} privileges" if scope && scope != next_scope
+    scope ||= next_scope if !@explicit_home || instance
+    if !scope && (command_dir || local_uid)
+      raise ArgumentError, 'Use --scope for a managed installation at a custom SHELLCRASH_HOME'
     end
-    path = existing_config
-    atomic_write(path, "mixed-port: 7890\nmode: rule\nrules:\n  - MATCH,DIRECT\n") unless File.exist?(path)
-    puts "Installed ShellCrash in #{@home}"
-    puts "Run: sh #{File.join(@home, 'menu.sh').inspect}"
+    raise ArgumentError, '--local-uid is for a system installation' if local_uid && scope != 'system'
+
+    old = instance
+    raise 'The installation scope cannot change in place' if old && old['scope'] != scope
+    command = if scope
+                command_dir ? File.join(command_dir, 'crash') :
+                  old&.fetch('command') || (scope == 'system' ? SYSTEM_COMMAND : user_command)
+              end
+    if scope == 'system'
+      require_system_path(@home)
+      require_system_path(File.dirname(command))
+    end
+    target_uid = if scope == 'system'
+                   local_uid || old&.fetch('local-uid', nil) || Integer(ENV.fetch('SUDO_UID', '0'))
+                 end
+    if target_uid && !target_uid.zero?
+      raise ArgumentError, 'Choose a non-root local UID' if target_uid.negative?
+      Etc.getpwuid(target_uid)
+    elsif local_uid
+      raise ArgumentError, 'Choose a non-root local UID'
+    end
+    raise ArgumentError, 'ShellCrash paths must not contain newlines' if command && [command, @home].any? { |path| path.match?(/[\r\n]/) }
+    check_command_path(command) if command
+
+    locked do
+      install_core(args + archive_options)
+      FileUtils.mkdir_p(@yamls, mode: 0o700)
+      %w[darwin.rb darwin_pf.py darwin_udp.py darwin_tcp.py darwin_tproxy.py menu.sh start.sh].each do |file|
+        source = File.join(__dir__, file)
+        destination = File.join(@home, file)
+        FileUtils.install(source, destination, mode: 0o755) unless File.identical?(source, destination)
+      end
+      path = existing_config
+      atomic_write(path, "mixed-port: 7890\nmode: rule\nrules:\n  - MATCH,DIRECT\n") unless File.exist?(path)
+      if command
+        File.chmod(0o755, @home) if scope == 'system'
+        FileUtils.mkdir_p(File.dirname(command), mode: 0o755)
+        check_command_path(command)
+        atomic_write(command, command_script(scope), 0o755)
+        atomic_write(@instance_file, JSON.generate('scope' => scope, 'mode' => old&.fetch('mode') || 'pure',
+                                                    'command' => command, 'local-uid' => target_uid), 0o644)
+      end
+    end
+    puts "Installed #{scope || 'standalone'} ShellCrash in #{@home}"
+    if command
+      register_user_path(File.dirname(command)) if scope == 'user' && command == user_command
+      puts "Run: #{Shellwords.escape(command)}"
+    else
+      puts "Run: sh #{File.join(@home, 'menu.sh').inspect}"
+    end
+  end
+
+  def instance
+    JSON.parse(File.read(@instance_file)) if File.file?(@instance_file)
+  end
+
+  def system_reader?
+    !Process.euid.zero? && instance&.fetch('scope') == 'system'
+  end
+
+  def user_command
+    File.expand_path('~/.local/bin/crash')
+  end
+
+  def command_marker
+    "# ShellCrash command for #{@home}"
+  end
+
+  def command_script(scope)
+    <<~SH
+      #!/bin/sh
+      #{command_marker}
+      scope=#{scope}
+      if [ "$scope" = user ] && [ "$(/usr/bin/id -u)" -eq 0 ]; then
+        echo 'Use a regular shell for a user installation, or run #{SYSTEM_COMMAND} with sudo.' >&2
+        exit 1
+      fi
+      case "$1" in
+        --user)
+          shift
+          if [ "$scope" = system ]; then
+            if [ "$(/usr/bin/id -u)" -ne 0 ] && [ -x "$HOME/.local/bin/crash" ]; then
+              exec "$HOME/.local/bin/crash" "$@"
+            fi
+            echo 'Select a user installation from its regular shell.' >&2
+            exit 1
+          fi
+          ;;
+        --system)
+          shift
+          if [ "$scope" = user ]; then
+            if [ -x #{SYSTEM_COMMAND} ]; then
+              exec #{SYSTEM_COMMAND} "$@"
+            fi
+            echo 'Install the system instance first.' >&2
+            exit 1
+          fi
+          ;;
+      esac
+      unset CRASHDIR
+      SHELLCRASH_HOME=#{Shellwords.escape(@home)}
+      export SHELLCRASH_HOME
+      exec /usr/bin/ruby #{Shellwords.escape(File.join(@home, 'darwin.rb'))} "$@"
+    SH
+  end
+
+  def check_command_path(path)
+    return unless File.exist?(path) || File.symlink?(path)
+    if File.file?(path) && !File.symlink?(path)
+      first, marker = File.open(path) { |file| [file.gets, file.gets] }
+      return if first == "#!/bin/sh\n" && marker == "#{command_marker}\n"
+    end
+
+    raise "An existing command occupies #{path}"
+  end
+
+  def require_system_path(path)
+    tree = File.expand_path(path)
+    until tree == '/'
+      if File.exist?(tree) || File.symlink?(tree)
+        status = File.lstat(tree)
+        unless status.directory? && status.uid.zero? && (status.mode & 0o022).zero?
+          raise "System installation requires a root-owned directory: #{tree}"
+        end
+      end
+      tree = File.dirname(tree)
+    end
+  end
+
+  def register_user_path(directory)
+    profile = case File.basename(ENV.fetch('SHELL', 'zsh'))
+              when 'zsh' then '~/.zshrc'
+              when 'bash' then '~/.bash_profile'
+              when 'sh', 'dash', 'ksh' then '~/.profile'
+              else return
+              end
+    path = File.expand_path(profile)
+    mark = '# ShellCrash command path'
+    return if File.file?(path) && File.read(path).lines.any? { |line| line.chomp == mark }
+
+    File.open(path, 'a', 0o600) do |file|
+      file.puts '', mark, "export PATH=#{Shellwords.escape(directory)}:\"$PATH\""
+    end
+    puts "Open a new terminal to use crash from #{profile}."
+  end
+
+  def select_mode(args)
+    settings = instance or raise 'Install a managed ShellCrash instance first'
+    return puts(settings.fetch('mode')) if args.empty?
+
+    selected = mode(args)
+    raise ArgumentError, 'Provide exactly one mode' unless args.empty?
+    raise ArgumentError, 'A user installation can select only pure' if settings['scope'] == 'user' && selected != 'pure'
+
+    atomic_write(@instance_file, JSON.generate(settings.merge('mode' => selected)), 0o644)
+    puts "Selected #{selected} for the #{settings['scope']} instance"
   end
 
   def install_core(args)
@@ -198,10 +403,11 @@ class DarwinShellCrash
     File.exist?(legacy) && !File.exist?(path) ? legacy : path
   end
 
-  def atomic_write(path, contents)
+  def atomic_write(path, contents, permissions = 0o600)
     Dir.mktmpdir('write-', File.dirname(path)) do |temp|
       file = File.join(temp, 'data')
-      File.open(file, 'wb', 0o600) { |out| out.write(contents) }
+      File.open(file, 'wb', permissions) { |out| out.write(contents) }
+      File.chmod(permissions, file)
       File.rename(file, path)
     end
   end
@@ -497,7 +703,8 @@ class DarwinShellCrash
 
     selectors = []
     if scope != 'lan'
-      uid = Integer(settings.fetch('local-uid', ENV.fetch('SUDO_UID', '0')))
+      default_uid = instance&.fetch('local-uid', nil) || ENV.fetch('SUDO_UID', '0')
+      uid = Integer(settings.fetch('local-uid', default_uid))
       raise ArgumentError, 'Set local-uid to the non-root UID whose traffic should be captured' unless (1..4_294_967_294).cover?(uid)
 
       source = settings['local-source'] ? pf_address(settings['local-source'], family) : 'any'
@@ -847,6 +1054,10 @@ class DarwinShellCrash
   end
 
   def status
+    puts "ShellCrash (#{instance.fetch('scope')}): #{@home}" if instance
+    if system_reader?
+      return puts("Use sudo #{Shellwords.escape(instance.fetch('command'))} -s status to inspect system processes.")
+    end
     session = running_session
     if session && session['mode'] == 'bypass'
       puts "PF bypass running via #{session['next-hop']}"
@@ -864,7 +1075,7 @@ class DarwinShellCrash
 
   def restart(args)
     session = running_session
-    selected = args.empty? && session ? session['mode'] : mode(args)
+    selected = args.empty? && session && !instance ? session['mode'] : mode(args)
     raise "Use run #{selected} in the foreground for the PF supervisor" if FOREGROUND_MODES.include?(selected)
     source = args.shift || (session && session['source'])
     stop
