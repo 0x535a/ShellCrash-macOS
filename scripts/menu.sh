@@ -1,6 +1,11 @@
 #!/bin/sh
 # Copyright (C) Juewuy
 
+if [ "$(uname -s)" = Darwin ]; then
+    [ "$#" -gt 0 ] || set -- menu
+    exec /usr/bin/ruby "$(dirname "$0")/darwin.rb" "$@"
+fi
+
 CRASHDIR=$(
     cd $(dirname $0)
     pwd

@@ -1,6 +1,10 @@
 #!/bin/sh
 # Copyright (C) Juewuy
 
+if [ "$(uname -s)" = Darwin ]; then
+    exec /usr/bin/ruby "$(dirname "$0")/darwin.rb" "$@"
+fi
+
 #初始化目录
 [ -z "$CRASHDIR" ] && CRASHDIR=$(
     cd $(dirname $0)

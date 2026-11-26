@@ -1,6 +1,15 @@
 #!/bin/sh
 # Copyright (C) Juewuy
 
+if [ "$(uname -s)" = Darwin ]; then
+    darwin_installer="$(dirname "$0")/scripts/darwin.rb"
+    if [ ! -f "$darwin_installer" ]; then
+        printf '%s\n' 'Run sh install_en.sh from a ShellCrash checkout containing the Darwin backend.' >&2
+        exit 1
+    fi
+    exec /usr/bin/ruby "$darwin_installer" install "$@"
+fi
+
 echo "***********************************************"
 echo "**               Welcome to                  **"
 echo "**               ShellCrash                  **"

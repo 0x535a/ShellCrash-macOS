@@ -1,6 +1,15 @@
 #!/bin/sh
 # Copyright (C) Juewuy
 
+if [ "$(uname -s)" = Darwin ]; then
+    darwin_installer="$(dirname "$0")/scripts/darwin.rb"
+    if [ ! -f "$darwin_installer" ]; then
+        printf '%s\n' '请从包含 Darwin 代码的 ShellCrash 工作区执行 sh install.sh。' >&2
+        exit 1
+    fi
+    exec /usr/bin/ruby "$darwin_installer" install "$@"
+fi
+
 echo "***********************************************"
 echo "**                 欢迎使用                  **"
 echo "**                ShellCrash                 **"
