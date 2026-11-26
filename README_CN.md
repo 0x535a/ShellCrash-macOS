@@ -153,7 +153,15 @@ export url='https://testingcf.jsdelivr.net/gh/juewuy/ShellCrash@master' \
 
 ### macOS（Apple Silicon）
 
-在包含 Darwin 后端的 ShellCrash 工作区运行安装。安装器会下载并校验适用于 macOS arm64 的 Mihomo，也可把官方 `mihomo-*.gz` 作为安装参数离线使用。
+安装器会下载并校验 macOS arm64 的 Mihomo。可以从含 Darwin 后端的工作区执行 `sh install.sh`，或从 `deploy` 在线安装。
+
+```sh
+url='https://raw.githubusercontent.com/0x535a/ShellCrash-macOS/deploy'
+installer=$(mktemp -t shellcrash)
+curl -fsSL "$url/install.sh" -o "$installer" && env url="$url" sh "$installer"
+```
+
+在线安装系统实例时，最后一步使用 `sudo env url="$url" sh "$installer"`。在本地工作区提供官方 `mihomo-*.gz` 时可离线安装内核。
 
 **普通用户安装**使用 `~/Library/Application Support/ShellCrash`。重新打开终端后，可使用 `crash` 菜单和纯净模式。
 
@@ -189,7 +197,7 @@ crash        # 启动脚本交互选单
 crash -h     # 查看命令帮助列表
 ```
 
-### 运行依赖说明
+### Linux 运行依赖说明
 | 依赖组件 | 必要性 | 说明 |
 | :--- | :--- | :--- |
 | curl / wget | 必须 | 缺少时将无法进行节点保存、在线安装及更新操作 |

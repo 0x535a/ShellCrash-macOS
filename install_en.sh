@@ -2,12 +2,19 @@
 # Copyright (C) Juewuy
 
 if [ "$(uname -s)" = Darwin ]; then
+    export SHELLCRASH_LANGUAGE=en
     darwin_installer="$(dirname "$0")/scripts/darwin.rb"
-    if [ ! -f "$darwin_installer" ]; then
-        printf '%s\n' 'Run sh install_en.sh from a ShellCrash checkout containing the Darwin backend.' >&2
-        exit 1
-    fi
-    exec /usr/bin/ruby "$darwin_installer" install "$@"
+    [ ! -f "$darwin_installer" ] || exec /usr/bin/ruby "$darwin_installer" install "$@"
+    case "${url:-}" in
+        https://*) ;;
+        *) printf '%s\n' 'Set url to a ShellCrash HTTPS distribution with the Darwin backend.' >&2; exit 1 ;;
+    esac
+    darwin_bootstrap=$(/usr/bin/mktemp -t shellcrash-darwin) || exit 1
+    trap '/bin/rm -f "$darwin_bootstrap"' 0
+    /usr/bin/curl -q --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+        --connect-timeout 15 --max-time 60 --output "$darwin_bootstrap" -- "${url%/}/scripts/darwin_distribution.rb" &&
+        /usr/bin/ruby "$darwin_bootstrap" "$url" "$@"
+    exit "$?"
 fi
 
 echo "***********************************************"

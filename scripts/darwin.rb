@@ -12,6 +12,7 @@ require 'socket'
 require 'tmpdir'
 require 'yaml'
 require 'zlib'
+require_relative 'darwin_distribution'
 require_relative 'darwin_launchd'
 
 $stdout.sync = true
@@ -129,27 +130,38 @@ class DarwinShellCrash
   end
 
   def managed_menu
+    chinese = instance.fetch('language', 'en') == 'zh'
     loop do
       puts "ShellCrash (#{instance.fetch('scope')}): #{@home}"
-      puts "1. Start/restart\n2. Select connection mode (#{instance.fetch('mode')})\n3. Stop\n4. Autostart\n6. Import configuration\n8. Status\n0. Exit"
+      selected = instance.fetch('mode')
+      if chinese
+        puts "1. 启动/重启服务\n2. 功能设置（#{selected}）\n3. 停止服务\n4. 启动设置\n6. 配置文件管理\n8. 运行状态\n0. 退出"
+      else
+        puts "1. Start/restart\n2. Select connection mode (#{selected})\n3. Stop\n4. Autostart\n6. Configuration\n8. Status\n0. Exit"
+      end
       print '> '
       case $stdin.gets&.strip
       when '1' then call(['restart'])
       when '2'
         choices = instance['scope'] == 'user' ? ['pure'] : MODES
-        print "Mode (#{choices.join(', ')}): "
+        print "#{chinese ? '连接模式' : 'Mode'} (#{choices.join(', ')}): "
         value = $stdin.gets&.strip
         call(['mode', value]) if value && !value.empty?
       when '3' then call(['stop'])
       when '4'
         call(['autostart'])
-        print 'Autostart (enable/disable, empty to cancel): '
+        print(chinese ? '自启设置（enable/disable，回车取消）: ' : 'Autostart (enable/disable, empty to cancel): ')
         value = $stdin.gets&.strip
         call(['autostart', value]) if value && !value.empty?
       when '6'
-        print 'YAML file: '
-        source = $stdin.gets&.strip
-        call(['config', 'import', source]) if source && !source.empty?
+        puts(chinese ? "1. 导入本地 YAML\n2. 下载完整 YAML\n0. 返回" : "1. Import local YAML\n2. Download complete YAML\n0. Back")
+        print '> '
+        action = { '1' => 'import', '2' => 'fetch' }[$stdin.gets&.strip]
+        if action
+          print(action == 'import' ? (chinese ? 'YAML 路径: ' : 'YAML file: ') : 'URL: ')
+          source = $stdin.gets&.strip
+          call(['config', action, source]) if source && !source.empty?
+        end
       when '8' then call(['status'])
       when nil, '0' then break
       end
@@ -215,7 +227,7 @@ class DarwinShellCrash
     locked do
       install_core(args + archive_options)
       FileUtils.mkdir_p(@yamls, mode: 0o700)
-      %w[darwin.rb darwin_launchd.rb darwin_pf.py darwin_udp.py darwin_tcp.py darwin_tproxy.py menu.sh start.sh].each do |file|
+      DarwinDistribution::FILES.each do |file|
         source = File.join(__dir__, file)
         destination = File.join(@home, file)
         FileUtils.install(source, destination, mode: 0o755) unless File.identical?(source, destination)
@@ -227,8 +239,10 @@ class DarwinShellCrash
         FileUtils.mkdir_p(File.dirname(command), mode: 0o755)
         check_command_path(command)
         atomic_write(command, command_script(scope), 0o755)
+        language = ENV['SHELLCRASH_LANGUAGE'] || old&.fetch('language', nil) || 'en'
         atomic_write(@instance_file, JSON.generate('scope' => scope, 'mode' => old&.fetch('mode') || 'pure',
-                                                    'command' => command, 'local-uid' => target_uid), 0o644)
+                                                    'command' => command, 'local-uid' => target_uid,
+                                                    'language' => language), 0o644)
       end
     end
     puts "Installed #{scope || 'standalone'} ShellCrash in #{@home}"
@@ -388,11 +402,7 @@ class DarwinShellCrash
   end
 
   def download(url, path, protocols = '=https')
-    unless system('curl', '-q', '--fail', '--silent', '--show-error', '--location',
-                  '--proto', protocols, '--proto-redir', protocols, '--connect-timeout', '15', '--max-time', '900',
-                  '--output', path, '--', url)
-      raise 'HTTPS download failed'
-    end
+    DarwinDistribution.download(url, path, protocols: protocols)
   end
 
   def config(args)

@@ -148,12 +148,20 @@ If online installation is not possible, please follow the guide for local instal
 
 ### macOS (Apple Silicon)
 
-Run the installer from a ShellCrash checkout containing the Darwin backend. It downloads and verifies the macOS arm64 Mihomo release. Pass an official `mihomo-*.gz` archive to install offline.
+The installer downloads and verifies the macOS arm64 Mihomo release. Run `sh install_en.sh` from a checkout with the Darwin backend, or install online from `deploy`.
+
+```sh
+url='https://raw.githubusercontent.com/0x535a/ShellCrash-macOS/deploy'
+installer=$(mktemp -t shellcrash)
+curl -fsSL "$url/install_en.sh" -o "$installer" && env url="$url" sh "$installer"
+```
+
+For an online system installation, use `sudo env url="$url" sh "$installer"` in the last step. Pass an official `mihomo-*.gz` archive when installing from a checkout to use an offline core.
 
 **User installation** uses `~/Library/Application Support/ShellCrash`. Open a new terminal to use the `crash` menu and Pure mode.
 
 ```sh
-sh install.sh
+sh install_en.sh
 crash -s start
 crash -s status
 crash -s autostart enable   # Start at login
@@ -163,7 +171,7 @@ crash -s stop
 **System installation** uses `/Library/Application Support/ShellCrash`. Use `sudo` in the terminal to change the system service.
 
 ```sh
-sudo sh install.sh
+sudo sh install_en.sh
 sudo /usr/local/bin/crash mode tun
 sudo /usr/local/bin/crash -s start
 crash --system -s status
@@ -184,7 +192,7 @@ crash        # Launch the interactive script menu
 crash -h     # View the list of command help
 ```
 
-### Running Dependencies
+### Linux Running Dependencies
 | Component | Necessity | Description |
 | :--- | :--- | :--- |
 | curl / wget | Mandatory | Required for node saving, online installation, and update operations. |
