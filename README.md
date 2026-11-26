@@ -146,6 +146,33 @@ If online installation is not possible, please follow the guide for local instal
 
 - [Local ShellCrash Installation Tutorial | Juewuy's Blog](https://juewuy.github.io/bdaz)
 
+### macOS (Apple Silicon)
+
+Run the installer from a ShellCrash checkout containing the Darwin backend. It downloads and verifies the macOS arm64 Mihomo release. Pass an official `mihomo-*.gz` archive to install offline.
+
+**User installation** uses `~/Library/Application Support/ShellCrash`. Open a new terminal to use the `crash` menu and Pure mode.
+
+```sh
+sh install.sh
+crash -s start
+crash -s status
+crash -s autostart enable   # Start at login
+crash -s stop
+```
+
+**System installation** uses `/Library/Application Support/ShellCrash`. Use `sudo` in the terminal to change the system service.
+
+```sh
+sudo sh install.sh
+sudo /usr/local/bin/crash mode tun
+sudo /usr/local/bin/crash -s start
+crash --system -s status
+sudo /usr/local/bin/crash -s autostart enable  # Start at boot
+sudo /usr/local/bin/crash -s stop
+```
+
+Use `crash --user` or `crash --system` to select an instance. The user installation uses a `LaunchAgent` and the system installation uses a `LaunchDaemon`. Use the autostart menu or `crash -s autostart disable` to turn off future automatic starts. PF modes require a `pf_mount` helper compatible with the host's PF ABI in the system installation's `bin/` directory. Tproxy also requires `feth-qemu`. Run `crash -h` for configuration and mode commands.
+
 ---
 
 ## :book: Usage Instructions

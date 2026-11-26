@@ -151,6 +151,33 @@ export url='https://testingcf.jsdelivr.net/gh/juewuy/ShellCrash@master' \
 
 - [本地安装ShellCrash教程 | Juewuy's Blog](https://juewuy.github.io/bdaz)
 
+### macOS（Apple Silicon）
+
+在包含 Darwin 后端的 ShellCrash 工作区运行安装。安装器会下载并校验适用于 macOS arm64 的 Mihomo，也可把官方 `mihomo-*.gz` 作为安装参数离线使用。
+
+**普通用户安装**使用 `~/Library/Application Support/ShellCrash`。重新打开终端后，可使用 `crash` 菜单和纯净模式。
+
+```sh
+sh install.sh
+crash -s start
+crash -s status
+crash -s autostart enable   # 登录后启动
+crash -s stop
+```
+
+**系统安装**使用 `/Library/Application Support/ShellCrash`。系统服务的变更通过终端 `sudo` 授权。
+
+```sh
+sudo sh install.sh
+sudo /usr/local/bin/crash mode tun
+sudo /usr/local/bin/crash -s start
+crash --system -s status
+sudo /usr/local/bin/crash -s autostart enable  # 开机启动
+sudo /usr/local/bin/crash -s stop
+```
+
+`crash --user` 和 `crash --system` 显式选择实例。用户实例用 `LaunchAgent`，系统实例用 `LaunchDaemon`。菜单第 4 项或 `crash -s autostart disable` 可关闭下次自启。PF 模式需要在系统实例的 `bin/` 提供本机 ABI 适用的 `pf_mount`，Tproxy 还需要 `feth-qemu`。通过 `crash -h` 查看配置和模式命令。
+
 ---
 
 ## :book: 使用说明

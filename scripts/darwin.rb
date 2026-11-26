@@ -12,6 +12,7 @@ require 'socket'
 require 'tmpdir'
 require 'yaml'
 require 'zlib'
+require_relative 'darwin_launchd'
 
 $stdout.sync = true
 
@@ -36,13 +37,15 @@ class DarwinShellCrash
     @session_file = File.join(@runtime, 'session.json')
     @log = File.join(@home, 'logs', 'mihomo.log')
     @instance_file = File.join(@home, 'installation.json')
+    @service_ready = File.join(@runtime, 'service.ready')
   end
 
   def call(args)
     args = ['menu'] if args.empty? && instance
     args.shift if args.first == '-s'
     command = args.shift || 'help'
-    if system_reader? && (!%w[help --help -h menu status mode].include?(command) || (command == 'mode' && !args.empty?))
+    if system_reader? && (!%w[help --help -h menu status mode autostart].include?(command) ||
+                          (%w[mode autostart].include?(command) && !args.empty?))
       raise "Run this operation with sudo #{Shellwords.escape(instance.fetch('command'))}"
     end
     case command
@@ -55,10 +58,15 @@ class DarwinShellCrash
     when 'mode'
       args.empty? ? select_mode(args) : locked { select_mode(args) }
     when 'check' then locked { check_mode(mode(args), args.shift) }
-    when 'start', 'run' then launch(mode(args), args.shift, command == 'run')
-    when 'stop' then locked { stop }
+    when 'start'
+      selected, source = mode(args), args.shift
+      instance ? locked('service.lock') { start_service(selected, source) } : launch(selected, source, false)
+    when 'run' then launch(mode(args), args.shift, true)
+    when 'stop' then instance ? locked('service.lock') { stop_service } : locked { stop }
     when 'status' then system_reader? ? status : locked { status }
-    when 'restart' then locked { restart(args) }
+    when 'restart'
+      instance ? locked('service.lock') { restart_service(args) } : locked { restart(args) }
+    when 'autostart' then autostart(args)
     else raise ArgumentError, "Unknown Darwin command #{command}. See help."
     end
     0
@@ -79,8 +87,8 @@ class DarwinShellCrash
       pf-rules [redir|bypass]            Preview the configured PF rules
       run [pure|redir|tun|mix|bypass|tproxy] [FILE]
       mode [pure|redir|tun|mix|bypass|tproxy]
-      start [pure|tun] [FILE]            Start the selected mode
-      status | stop | restart [pure|tun] [FILE]
+      -s start|stop|restart|status       Manage the selected installation's service
+      -s autostart [enable|disable]      Check or change login/boot startup
       crash --user / crash --system selects the installed instance.
       SHELLCRASH_HOME sets the configuration and data directory for direct scripts.
       Tun requires root and uses Mihomo's system routing.
@@ -123,8 +131,7 @@ class DarwinShellCrash
   def managed_menu
     loop do
       puts "ShellCrash (#{instance.fetch('scope')}): #{@home}"
-      status if system_reader?
-      puts "1. Start/restart\n2. Select connection mode (#{instance.fetch('mode')})\n3. Stop\n6. Import configuration\n8. Status\n0. Exit"
+      puts "1. Start/restart\n2. Select connection mode (#{instance.fetch('mode')})\n3. Stop\n4. Autostart\n6. Import configuration\n8. Status\n0. Exit"
       print '> '
       case $stdin.gets&.strip
       when '1' then call(['restart'])
@@ -134,6 +141,11 @@ class DarwinShellCrash
         value = $stdin.gets&.strip
         call(['mode', value]) if value && !value.empty?
       when '3' then call(['stop'])
+      when '4'
+        call(['autostart'])
+        print 'Autostart (enable/disable, empty to cancel): '
+        value = $stdin.gets&.strip
+        call(['autostart', value]) if value && !value.empty?
       when '6'
         print 'YAML file: '
         source = $stdin.gets&.strip
@@ -146,9 +158,9 @@ class DarwinShellCrash
     end
   end
 
-  def locked
+  def locked(name = 'lock')
     FileUtils.mkdir_p(@runtime, mode: 0o700)
-    File.open(File.join(@runtime, 'lock'), File::RDWR | File::CREAT, 0o600) do |lock|
+    File.open(File.join(@runtime, name), File::RDWR | File::CREAT, 0o600) do |lock|
       lock.flock(File::LOCK_EX)
       yield
     end
@@ -203,7 +215,7 @@ class DarwinShellCrash
     locked do
       install_core(args + archive_options)
       FileUtils.mkdir_p(@yamls, mode: 0o700)
-      %w[darwin.rb darwin_pf.py darwin_udp.py darwin_tcp.py darwin_tproxy.py menu.sh start.sh].each do |file|
+      %w[darwin.rb darwin_launchd.rb darwin_pf.py darwin_udp.py darwin_tcp.py darwin_tproxy.py menu.sh start.sh].each do |file|
         source = File.join(__dir__, file)
         destination = File.join(@home, file)
         FileUtils.install(source, destination, mode: 0o755) unless File.identical?(source, destination)
@@ -537,6 +549,7 @@ class DarwinShellCrash
         worker = mount_pf(session)
         wait_for_pf(worker) { interrupted }
       end
+      service_ready
       until interrupted
         result = Process.waitpid2(session['pid'], Process::WNOHANG)
         if result
@@ -558,10 +571,23 @@ class DarwinShellCrash
         release_pf(worker) if worker
       ensure
         stop_child(session['pid'])
+        clear_service_ready
         signals.each { |name, handler| Signal.trap(name, handler) }
         locked { remove_session(session) }
       end
     end
+  end
+
+  def service_ready
+    atomic_write(@service_ready, "#{Process.pid}\n") if ENV['SHELLCRASH_LAUNCHD'] == '1'
+  end
+
+  def clear_service_ready
+    return unless ENV['SHELLCRASH_LAUNCHD'] == '1' && File.file?(@service_ready)
+
+    File.unlink(@service_ready) if File.read(@service_ready).to_i == Process.pid
+  rescue Errno::ENOENT
+    nil
   end
 
   def wait_for_pf(worker)
@@ -992,6 +1018,7 @@ class DarwinShellCrash
                     'supervisor' => Process.pid, 'supervisor-start' => process_start(Process.pid) }
         atomic_write(@session_file, JSON.generate(session))
         puts "PF bypass running via #{next_hop}"
+        service_ready
       end
       misses = 0
       check_at = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 1
@@ -1010,6 +1037,7 @@ class DarwinShellCrash
       begin
         release_pf(worker) if worker
       ensure
+        clear_service_ready
         signals.each { |name, handler| Signal.trap(name, handler) }
         locked { remove_session(session) } if session
         FileUtils.remove_entry_secure(directory) if directory && File.directory?(directory)
@@ -1054,11 +1082,17 @@ class DarwinShellCrash
   end
 
   def status
-    puts "ShellCrash (#{instance.fetch('scope')}): #{@home}" if instance
-    if system_reader?
-      return puts("Use sudo #{Shellwords.escape(instance.fetch('command'))} -s status to inspect system processes.")
+    settings = instance
+    session = running_session unless system_reader?
+    if settings
+      puts "ShellCrash (#{settings.fetch('scope')}): #{@home}"
+      puts "Selected mode: #{settings.fetch('mode')}"
+      pid = launchd.pid
+      puts "launchd service running (PID #{pid})" if pid
+      puts "Autostart #{launchd.autostart? ? 'enabled' : 'disabled'}"
+      puts "Service log: #{launchd.log}"
+      return if pid && !session
     end
-    session = running_session
     if session && session['mode'] == 'bypass'
       puts "PF bypass running via #{session['next-hop']}"
     elsif session
@@ -1066,6 +1100,45 @@ class DarwinShellCrash
     else
       puts 'Mihomo stopped'
     end
+  end
+
+  def launchd
+    settings = instance or raise 'Install a managed ShellCrash instance first'
+    @launchd ||= DarwinLaunchd.new(@home, settings.fetch('scope'))
+  end
+
+  def start_service(selected, source)
+    if instance.fetch('scope') == 'user' && (selected != 'pure' || Process.euid.zero?)
+      raise 'Use the regular user shell for Pure, or a system installation for transparent modes'
+    end
+    require_system_path(@home) if instance.fetch('scope') == 'system'
+    locked do
+      raise 'A ShellCrash instance is already running' if running_session
+    end
+    puts "ShellCrash started (PID #{launchd.start(selected, source && File.expand_path(source))})"
+  end
+
+  def stop_service
+    launchd.stop
+    locked { stop }
+  end
+
+  def restart_service(args)
+    selected, source = mode(args), args.shift
+    stop_service
+    start_service(selected, source)
+  end
+
+  def autostart(args)
+    action = args.shift
+    if action
+      raise ArgumentError, 'Use autostart [enable|disable]' unless %w[enable disable].include?(action) && args.empty?
+      raise 'Manage the user LaunchAgent from the regular user shell' if Process.euid.zero? && instance&.fetch('scope') == 'user'
+
+      require_system_path(@home) if instance&.fetch('scope') == 'system'
+      locked('service.lock') { launchd.autostart(action == 'enable') }
+    end
+    puts "Autostart #{launchd.autostart? ? 'enabled' : 'disabled'}"
   end
 
   def port_summary(session)
